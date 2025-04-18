@@ -1,9 +1,11 @@
 import datetime
 import enum
+import time
 import json
 import logging
 import random
 import re
+import pytz
 import string
 import pandas as pd
 from websocket import create_connection
@@ -28,18 +30,43 @@ class Interval(enum.Enum):
     in_weekly = "1W"
     in_monthly = "1M"
 
+interval_length_in_sec = {
+    "1":60,
+    "3":180,
+    "5":300,
+    "15":900,
+    "30":1800,
+    "45":2700,
+    "1H":3600,
+    "2H":7200,
+    "3H":10800,
+    "4H":14400,
+    "1D":86400,
+    "1W":604800,
+    "1M":2592000,
+}
+
 
 class TvDatafeed:
-    __sign_in_url = 'https://www.tradingview.com/accounts/signin/'
-    __search_url = 'https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production'
+    __sign_in_url = "https://www.tradingview.com/accounts/signin/"
+    __search_url = (
+        "https://symbol-search.tradingview.com/symbol_search/?text={}&hl=1&exchange={}&lang=en&type=&domain=production"
+    )
     __ws_headers = json.dumps({"Origin": "https://data.tradingview.com"})
-    __signin_headers = {'Referer': 'https://www.tradingview.com'}
+    __signin_headers = {"Referer": "https://www.tradingview.com"}
     __ws_timeout = 5
+    __ws_debug = False
+    __pro_data_url = "wss://prodata.tradingview.com/socket.io/websocket"
+    __normal_data_url = "wss://data.tradingview.com/socket.io/websocket"
 
     def __init__(
         self,
         username: str = None,
         password: str = None,
+        auth_token: str = None,
+        ws_debug: bool = __ws_debug,
+        pro_data: bool = False,
+        return_time_zone: bool = True,
     ) -> None:
         """Create TvDatafeed object
 
@@ -48,44 +75,42 @@ class TvDatafeed:
             password (str, optional): tradingview password. Defaults to None.
         """
 
-        self.ws_debug = False
+        self.ws_debug = ws_debug
 
-        self.token = self.__auth(username, password)
+        if auth_token is not None:
+            self.token = auth_token
+        else:
+            self.token = self.__auth(username, password)
 
         if self.token is None:
             self.token = "unauthorized_user_token"
-            logger.warning(
-                "you are using nologin method, data you access may be limited"
-            )
+            logger.warning("you are using nologin method, data you access may be limited")
 
         self.ws = None
         self.session = self.__generate_session()
         self.chart_session = self.__generate_chart_session()
+        self.ws_connection_url = self.__pro_data_url if pro_data else self.__normal_data_url
+        self.return_time_zone = return_time_zone
 
     def __auth(self, username, password):
 
-        if (username is None or password is None):
+        if username is None or password is None:
             token = None
 
         else:
-            data = {"username": username,
-                    "password": password,
-                    "remember": "on"}
+            data = {"username": username, "password": password, "remember": "on"}
             try:
-                response = requests.post(
-                    url=self.__sign_in_url, data=data, headers=self.__signin_headers)
-                token = response.json()['user']['auth_token']
+                response = requests.post(url=self.__sign_in_url, data=data, headers=self.__signin_headers)
+                token = response.json()["user"]["auth_token"]
             except Exception as e:
-                logger.error('error while signin')
+                logger.error("error while signin")
                 token = None
 
         return token
 
     def __create_connection(self):
         logging.debug("creating websocket connection")
-        self.ws = create_connection(
-            "wss://data.tradingview.com/socket.io/websocket", headers=self.__ws_headers, timeout=self.__ws_timeout
-        )
+        self.ws = create_connection(self.ws_connection_url, headers=self.__ws_headers, timeout=self.__ws_timeout)
 
     @staticmethod
     def __filter_raw_message(text):
@@ -101,16 +126,14 @@ class TvDatafeed:
     def __generate_session():
         stringLength = 12
         letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
+        random_string = "".join(random.choice(letters) for i in range(stringLength))
         return "qs_" + random_string
 
     @staticmethod
     def __generate_chart_session():
         stringLength = 12
         letters = string.ascii_lowercase
-        random_string = "".join(random.choice(letters)
-                                for i in range(stringLength))
+        random_string = "".join(random.choice(letters) for i in range(stringLength))
         return "cs_" + random_string
 
     @staticmethod
@@ -131,10 +154,16 @@ class TvDatafeed:
         self.ws.send(m)
 
     @staticmethod
-    def __create_df(raw_data, symbol):
+    def __create_df(raw_data, symbol, interval_len, time_zone):
+
         try:
-            out = re.search('"s":\[(.+?)\}\]', raw_data).group(1)
-            x = out.split(',{"')
+            matches = re.findall('"s":\[(.+?)\}\]', raw_data)
+            matches = matches[-1] if matches else None
+
+            if not matches:
+                raise ValueError("No data found")
+
+            x = matches.split(',{"')
             data = list()
             volume_data = True
 
@@ -156,15 +185,19 @@ class TvDatafeed:
                     except ValueError:
                         volume_data = False
                         row.append(0.0)
-                        logger.debug('no volume data')
+                        logger.debug("no volume data")
 
                 data.append(row)
 
-            data = pd.DataFrame(
-                data, columns=["datetime", "open",
-                               "high", "low", "close", "volume"]
-            ).set_index("datetime")
+            data = pd.DataFrame(data, columns=["datetime", "open", "high", "low", "close", "volume"]).set_index(
+                "datetime"
+            )
+
             data.insert(0, "symbol", value=symbol)
+
+            if time_zone:
+                data.insert(6, "timezone", value=time_zone)
+                
             return data
         except AttributeError:
             logger.error("no data, please check the exchange and symbol")
@@ -185,12 +218,59 @@ class TvDatafeed:
 
         return symbol
 
+    @staticmethod
+    def is_valid_date_range(start_timestamp, end_timestamp):
+        if not start_timestamp and not end_timestamp:
+            return False
+        try:
+            start_date = datetime.datetime.fromtimestamp(start_timestamp)
+            end_date = datetime.datetime.fromtimestamp(end_timestamp)
+            if start_date > end_date:
+                raise ValueError("Start date cannot be greater than end date")
+
+            # check if date is in the future
+            if start_date > datetime.datetime.now() or end_date > datetime.datetime.now():
+                raise ValueError("Date range cannot be in the future")
+
+            # check if date is earlier than 2000-01-01
+            if start_date < datetime.datetime(2000, 1, 1):
+                raise ValueError("Date range cannot be earlier than 2000-01-01")
+
+            return True
+
+        except Exception as e:
+            print("Error in date range:", e)
+            logger.error(e)
+            return False
+
+    @staticmethod
+    def __get_response(ws, ws_debug, symbol, _type="Interval"):
+        raw_data = ""
+        logger.debug(f"getting data for {symbol} as {_type}...")
+        while True:
+            try:
+                result = ws.recv()
+                raw_data = raw_data + result + "\n"
+            except Exception as e:
+                logger.error(e)
+                break
+
+            if "series_completed" in result:
+                break
+        if ws_debug:
+            print("--" * 20, "Response", "--" * 20)
+            print(raw_data)
+
+        return raw_data
+
     def get_hist(
         self,
         symbol: str,
         exchange: str = "NSE",
         interval: Interval = Interval.in_daily,
         n_bars: int = 10,
+        start_timestamp: int = None,
+        end_timestamp: int = None,
         fut_contract: int = None,
         extended_session: bool = False,
     ) -> pd.DataFrame:
@@ -207,11 +287,14 @@ class TvDatafeed:
         Returns:
             pd.Dataframe: dataframe with sohlcv as columns
         """
-        symbol = self.__format_symbol(
-            symbol=symbol, exchange=exchange, contract=fut_contract
-        )
+        symbol = self.__format_symbol(symbol=symbol, exchange=exchange, contract=fut_contract)
 
+        is_date_range_search = self.is_valid_date_range(start_timestamp, end_timestamp)
         interval = interval.value
+        interval_len = interval_length_in_sec[interval]
+
+        if is_date_range_search:
+            n_bars = 10
 
         self.__create_connection()
 
@@ -248,10 +331,7 @@ class TvDatafeed:
             ],
         )
 
-        self.__send_message(
-            "quote_add_symbols", [self.session, symbol,
-                                  {"flags": ["force_permission"]}]
-        )
+        self.__send_message("quote_add_symbols", [self.session, symbol, {"flags": ["force_permission"]}])
         self.__send_message("quote_fast_symbols", [self.session, symbol])
 
         self.__send_message(
@@ -270,34 +350,36 @@ class TvDatafeed:
             "create_series",
             [self.chart_session, "s1", "s1", "symbol_1", interval, n_bars],
         )
-        self.__send_message("switch_timezone", [
-                            self.chart_session, "exchange"])
+        self.__send_message("switch_timezone", [self.chart_session, "exchange"])
 
-        raw_data = ""
+        raw_data = self.__get_response(self.ws, self.ws_debug, symbol, _type="Interval")
+        time_zone = None
+        if self.return_time_zone:
+            time_zone = re.findall('"timezone":"(.+?)"', raw_data)[0]
 
-        logger.debug(f"getting data for {symbol}...")
-        while True:
-            try:
-                result = self.ws.recv()
-                raw_data = raw_data + result + "\n"
-            except Exception as e:
-                logger.error(e)
-                break
+        if is_date_range_search:
+            if interval_len < 86400:
+                start_timestamp = start_timestamp - 1800000
+                end_timestamp = end_timestamp - 1800000
+                print("start_timestamp", start_timestamp, "end_timestamp", end_timestamp)
+            time.sleep(0.3)
+            self.__send_message(
+                "modify_series",
+                [self.chart_session, "s1", "s1", "symbol_1", interval, f"r,{start_timestamp}:{end_timestamp}"],
+            )
 
-            if "series_completed" in result:
-                break
+            raw_data = self.__get_response(self.ws, self.ws_debug, symbol, _type="DateRange")
 
-        return self.__create_df(raw_data, symbol)
+        return self.__create_df(raw_data, symbol, interval_len, time_zone)
 
-    def search_symbol(self, text: str, exchange: str = ''):
+    def search_symbol(self, text: str, exchange: str = ""):
         url = self.__search_url.format(text, exchange)
 
         symbols_list = []
         try:
             resp = requests.get(url)
 
-            symbols_list = json.loads(resp.text.replace(
-                '</em>', '').replace('<em>', ''))
+            symbols_list = json.loads(resp.text.replace("</em>", "").replace("<em>", ""))
         except Exception as e:
             logger.error(e)
 
